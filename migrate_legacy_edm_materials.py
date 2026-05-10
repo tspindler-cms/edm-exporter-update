@@ -5,12 +5,16 @@ Material) to Eagle Dynamics io_scene_edm node groups with Image Texture nodes.
 
 Requirements
 ------------
-- Blender 3.6.x / 4.2.x / 4.5.x (same band as the official ED exporter).
+- Blender 4.2+ recommended (same band as Eagle Dynamics ``io_scene_edm``). The script
+  can still run on 3.6 if the legacy add-on is enabled there.
 - Eagle Dynamics add-on enabled so these node groups exist:
     EDM_Default_Material, EDM_Glass_Material, EDM_Mirror_Material
-- Legacy Material RNA (EDMDiffuseMapName, EDMMaterialType, …) must exist while this
-  runs. Easiest: enable legacy io_BlenderEdmExporter temporarily, or open a .blend
-  saved with it registered (RNA still loads).
+- Legacy Material fields (``EDMDiffuseMapName``, ``EDMMaterialType``, …) from
+  ``io_BlenderEdmExporter`` / madwax / Tobi-be: if the legacy add-on is **not**
+  loaded (typical in Blender 4.x), this script **re-registers the same Material RNA
+  names** so values saved in a 3.6 .blend file are readable again, then removes those
+  definitions when finished. Enable the real legacy add-on if you prefer not to use
+  the stub (``CONFIG["register_legacy_rna_stub"] = False``).
 
 Usage
 -----
@@ -28,9 +32,10 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Set, Tuple
+from typing import Iterable, List, Optional, Sequence, Set, Tuple
 
 import bpy
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 
 
 # -----------------------------------------------------------------------------
@@ -50,6 +55,10 @@ CONFIG = {
     "skip_if_edm_group_present": True,
     # Mark migrated materials so the script does not run twice.
     "id_prop_marker": "edm_legacy_migration_v1",
+    # If True and legacy add-on is absent, register temporary Material RNA matching
+    # io_BlenderEdmExporter so 3.6-saved fields load in 4.x. Set False to require the
+    # real legacy add-on instead.
+    "register_legacy_rna_stub": True,
     # Common image extensions tried for legacy basename fields (order matters).
     "texture_extensions": (
         ".dds",
@@ -63,6 +72,101 @@ CONFIG = {
         ".bmp",
     ),
 }
+
+
+# -----------------------------------------------------------------------------
+# Legacy Material RNA stub (3.6 file → 4.x without legacy add-on)
+# -----------------------------------------------------------------------------
+# When a .blend was saved with io_BlenderEdmExporter, Material fields are stored by
+# identifier. Re-defining the same bpy.props on bpy.types.Material restores Python
+# access in a 4.x session where the legacy add-on is not installed.
+
+_LEGACY_RNA_STUB_NAMES: List[str] = []
+_LEGACY_RNA_STUB_OWNER = False
+
+
+def _register_legacy_material_rna_stub() -> None:
+    """Attach legacy Material RNA to bpy.types.Material (matches madwax edmprops)."""
+    global _LEGACY_RNA_STUB_NAMES
+    if _LEGACY_RNA_STUB_NAMES:
+        return
+
+    items_mat_type = [
+        ("Glass", "Glass", "Glass"),
+        ("Solid", "Solid", "Solid"),
+        ("transp_self_illu", "transparent self-illuminated", "transparent self-illuminated"),
+        ("self_illu", "self-illuminated", "self-illuminated"),
+        ("additive_self_illu", "additive_self-illuminated", "additive_self-illuminated"),
+        ("bano", "bano_material", "bano_material"),
+        ("forest", "forest", "forest"),
+        ("Mirror", "Mirror", "Mirror"),
+    ]
+    items_blending = [
+        ("0", "0", "0"),
+        ("1", "1", "1"),
+        ("2", "2", "2"),
+        ("3", "3", "3"),
+    ]
+
+    defs: List[Tuple[str, object]] = [
+        ("EDMMaterialType", EnumProperty(items=items_mat_type, name="MaterialType", default="Solid")),
+        ("EDMBlending", EnumProperty(items=items_blending, name="Blending", default="0")),
+        ("EDMUseDiffuseMap", BoolProperty(name="Use diffuse map", default=True)),
+        ("EDMUseDamageMap", BoolProperty(name="Use Damage map", default=False)),
+        ("EDMUseDamageNormalMap", BoolProperty(name="Use Damage Normal map", default=False)),
+        ("EDMUseNormalMap", BoolProperty(name="Use normalmap", default=False)),
+        ("EDMUseSelfIllumination", BoolProperty(name="Use Selfillumination", default=False)),
+        ("EDMUseSpecularMap", BoolProperty(name="Use specular map/Roughtmet", default=False)),
+        ("EDMDiffuseMapName", StringProperty(name="filename", default="texture")),
+        ("EDMDamageMapName", StringProperty(name="filename", default="damage")),
+        ("EDMDamageNormalMapName", StringProperty(name="filename", default="damage_normal")),
+        ("EDMNormalMapName", StringProperty(name="filename", default="texture_normal")),
+        ("EDMSelfIlluminationMapName", StringProperty(name="filename", default="texture_illumination")),
+        ("EDMSpecularMapName", StringProperty(name="filename", default="texture_spec")),
+        ("EDMSelfIllumination", FloatProperty(name="Self Illumination Value", default=1.0, min=0.0, max=100.0)),
+        ("EDMDiffuseValue", FloatProperty(name="Diffuse value", default=1.0, min=0.0, max=10.0)),
+    ]
+
+    for attr, prop in defs:
+        setattr(bpy.types.Material, attr, prop)
+        _LEGACY_RNA_STUB_NAMES.append(attr)
+
+
+def _unregister_legacy_material_rna_stub() -> None:
+    global _LEGACY_RNA_STUB_NAMES
+    for name in _LEGACY_RNA_STUB_NAMES:
+        try:
+            delattr(bpy.types.Material, name)
+        except Exception:
+            pass
+    _LEGACY_RNA_STUB_NAMES = []
+
+
+def _acquire_legacy_material_rna(cfg: dict) -> bool:
+    """Ensure legacy Material RNA is readable. Returns True if migration may proceed."""
+    global _LEGACY_RNA_STUB_OWNER
+    if hasattr(bpy.types.Material, "EDMMaterialType"):
+        return True
+    if not cfg.get("register_legacy_rna_stub", True):
+        print(
+            "ERROR: Legacy Material RNA is missing and CONFIG['register_legacy_rna_stub'] "
+            "is False. Enable io_BlenderEdmExporter or turn the stub back on."
+        )
+        return False
+    _register_legacy_material_rna_stub()
+    _LEGACY_RNA_STUB_OWNER = True
+    print(
+        "NOTE: Temporary legacy Material RNA registered (read-only) so 3.6 .blend "
+        "fields are visible without the old add-on. It is removed when migration ends."
+    )
+    return hasattr(bpy.types.Material, "EDMMaterialType")
+
+
+def _release_legacy_material_rna() -> None:
+    global _LEGACY_RNA_STUB_OWNER
+    if _LEGACY_RNA_STUB_OWNER:
+        _unregister_legacy_material_rna_stub()
+        _LEGACY_RNA_STUB_OWNER = False
 
 
 # Legacy enum item names from io_BlenderEdmExporter/edmprops.py
@@ -110,6 +214,11 @@ MIRROR_SOCK = {
 }
 
 
+def legacy_addon_registered() -> bool:
+    """True if legacy Material EDM fields are readable (io_BlenderEdmExporter or stub)."""
+    return hasattr(bpy.types.Material, "EDMMaterialType")
+
+
 def parse_argv() -> dict:
     """Minimal overrides after ``--``: ``--texture-dir=/abs/path`` (repeatable)."""
     cfg = dict(CONFIG)
@@ -122,10 +231,6 @@ def parse_argv() -> dict:
     if extra_dirs:
         cfg["texture_search_dirs"] = list(cfg["texture_search_dirs"]) + extra_dirs
     return cfg
-
-
-def legacy_addon_registered() -> bool:
-    return hasattr(bpy.types.Material, "EDMMaterialType")
 
 
 def mesh_materials() -> Set[bpy.types.Material]:
@@ -365,8 +470,8 @@ def migrate_one_material(mat: bpy.types.Material, cfg: dict, roots: Sequence[Pat
 
     if not legacy_addon_registered():
         raise RuntimeError(
-            "Legacy Material RNA not found (EDMMaterialType missing). Enable "
-            "io_BlenderEdmExporter once, save, then run this script again."
+            "Legacy Material RNA missing (EDMMaterialType). "
+            "run_migration() should call _acquire_legacy_material_rna() first."
         )
 
     legacy_type = getattr(mat, "EDMMaterialType", LEGACY_TYPE_DEFAULT)
@@ -483,48 +588,48 @@ def migrate_one_material(mat: bpy.types.Material, cfg: dict, roots: Sequence[Pat
 
 def run_migration(cfg: Optional[dict] = None) -> Tuple[int, int]:
     cfg = cfg or parse_argv()
-    roots = resolve_texture_roots(cfg)
-    if not roots:
-        print(
-            "WARNING: No texture directories resolved. "
-            "Set CONFIG['texture_search_dirs'] or pass --texture-dir=… "
-            "(paths must exist). Images may fail to load.\n"
-            f"  Tried: {cfg['texture_search_dirs']!r}"
-        )
+    if not _acquire_legacy_material_rna(cfg):
+        return 0, 0
+    try:
+        roots = resolve_texture_roots(cfg)
+        if not roots:
+            print(
+                "WARNING: No texture directories resolved. "
+                "Set CONFIG['texture_search_dirs'] or pass --texture-dir=… "
+                "(paths must exist). Images may fail to load.\n"
+                f"  Tried: {cfg['texture_search_dirs']!r}"
+            )
 
-    candidates: Iterable[bpy.types.Material]
-    if cfg["only_used_by_mesh"]:
-        candidates = sorted(mesh_materials(), key=lambda m: m.name)
-    else:
-        candidates = sorted(bpy.data.materials, key=lambda m: m.name)
+        candidates: Iterable[bpy.types.Material]
+        if cfg["only_used_by_mesh"]:
+            candidates = sorted(mesh_materials(), key=lambda m: m.name)
+        else:
+            candidates = sorted(bpy.data.materials, key=lambda m: m.name)
 
-    done = 0
-    skipped = 0
-    for mat in candidates:
-        try:
-            if migrate_one_material(mat, cfg, roots):
-                done += 1
-            else:
+        done = 0
+        skipped = 0
+        for mat in candidates:
+            try:
+                if migrate_one_material(mat, cfg, roots):
+                    done += 1
+                else:
+                    skipped += 1
+            except Exception as ex:
+                print(f'  FAIL "{mat.name}": {ex}')
                 skipped += 1
-        except Exception as ex:
-            print(f'  FAIL "{mat.name}": {ex}')
-            skipped += 1
 
-    print(f"\nDone. Migrated: {done}, skipped/failed: {skipped}.")
-    print(
-        "Next: in Blender N-panel run **Update EDM Materials** on the ED exporter, "
-        "then verify RoughMet packing and object-level EDM custom props."
-    )
-    return done, skipped
+        print(f"\nDone. Migrated: {done}, skipped/failed: {skipped}.")
+        print(
+            "Next: in Blender N-panel run **Update EDM Materials** on the ED exporter, "
+            "then verify RoughMet packing and object-level EDM custom props."
+        )
+        return done, skipped
+    finally:
+        _release_legacy_material_rna()
 
 
 def main() -> None:
     cfg = parse_argv()
-    if not legacy_addon_registered():
-        print(
-            "NOTE: Legacy RNA not registered yet. If migration finds nothing to read, "
-            "enable io_BlenderEdmExporter and re-open this file."
-        )
     run_migration(cfg)
 
 
