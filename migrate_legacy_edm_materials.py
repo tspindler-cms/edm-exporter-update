@@ -1,20 +1,29 @@
 # SPDX-License-Identifier: MIT
 """
-Migrate legacy madwax / Tobias Becker Blender EDM materials (RNA filename fields on
-Material) to Eagle Dynamics io_scene_edm node groups with Image Texture nodes.
+Migrate legacy Blender EDM materials (Tobi-be / madwax ``io_BlenderEdmExporter``) to
+Eagle Dynamics ``io_scene_edm`` node setups. Official ED exporter source and docs:
+https://github.com/EagleDynamics/Blender-EDM-Exporter (Blender **3.6**, **4.2**, and **4.5** LTS per upstream).
 
 Requirements
 ------------
 - Blender 4.2+ recommended (same band as Eagle Dynamics ``io_scene_edm``). The script
   can still run on 3.6 if the legacy add-on is enabled there.
-- Eagle Dynamics add-on enabled so these node groups exist:
-    EDM_Default_Material, EDM_Glass_Material, EDM_Mirror_Material
+- Eagle Dynamics ``io_scene_edm`` enabled. Template node groups (``EDM_Default_Material``,
+  etc.) are **not** created by ``Update EDM materials`` when they are absent from the
+  file; this script creates any missing templates from the add-on pickles when
+  ``CONFIG["ensure_edm_node_groups"]`` is true (default).
 - Legacy Material fields (``EDMDiffuseMapName``, ``EDMMaterialType``, …) from
   ``io_BlenderEdmExporter`` / madwax / Tobi-be: if the legacy add-on is **not**
   loaded (typical in Blender 4.x), this script **re-registers the same Material RNA
   names** so values saved in a 3.6 .blend file are readable again, then removes those
   definitions when finished. Enable the real legacy add-on if you prefer not to use
   the stub (``CONFIG["register_legacy_rna_stub"] = False``).
+
+Export expects **custom** ED shader nodes (``EdmDefaultShaderNodeType``, …), not a plain
+``ShaderNodeGroup`` wired to ``EDM_Default_Material`` ("Green RW" error). This script
+uses ``post_init(MatDesc)`` like *Add* → EDM in the shader editor. If an older script
+version left a plain group, remove the material ID property ``edm_legacy_migration_v1``
+and migrate again.
 
 Usage
 -----
@@ -25,14 +34,16 @@ Usage
 
 Optional CLI overrides after `--` (see parse_argv()).
 
-This script only uses bpy; it does not import io_scene_edm modules.
+For missing ED shader node groups, the script temporarily prepends the add-on
+directory to ``sys.path`` and imports ``materials.materials`` (same as ``io_scene_edm``)
+to run ``MatDesc.create()`` — no dependency on the GUI.
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
@@ -59,6 +70,9 @@ CONFIG = {
     # io_BlenderEdmExporter so 3.6-saved fields load in 4.x. Set False to require the
     # real legacy add-on instead.
     "register_legacy_rna_stub": True,
+    # If True, create EDM_Default_Material / Glass / Mirror in bpy.data when missing
+    # (typical for legacy-only .blend files opened in 4.x). Uses io_scene_edm pickles.
+    "ensure_edm_node_groups": True,
     # Common image extensions tried for legacy basename fields (order matters).
     "texture_extensions": (
         ".dds",
@@ -255,15 +269,121 @@ def edm_tree_names() -> Set[str]:
     }
 
 
+# Node groups this migration wires textures into (must exist or be creatable).
+_EDM_MIGRATION_TEMPLATE_TREES: Tuple[str, ...] = (
+    "EDM_Default_Material",
+    "EDM_Glass_Material",
+    "EDM_Mirror_Material",
+)
+
+# io_scene_edm custom shader nodes (export rejects plain ShaderNodeGroup — "Green RW").
+_EDM_CUSTOM_SHADER_BL_IDNAMES: Set[str] = {
+    "EdmDefaultShaderNodeType",
+    "EdmDeckShaderNodeType",
+    "EdmFakeOmniShaderNodeType",
+    "EdmFakeSpotShaderNodeType",
+    "EdmGlassShaderNodeType",
+    "EdmMirrorShaderNodeType",
+    "EdmMatrialShaderNodeType",
+}
+
+# tree_name → bpy node type for nodes.new(type=…); then post_init(MatDesc) wires the group.
+_EDM_TREE_TO_CUSTOM_BL_ID: Dict[str, str] = {
+    "EDM_Default_Material": "EdmDefaultShaderNodeType",
+    "EDM_Glass_Material": "EdmGlassShaderNodeType",
+    "EDM_Mirror_Material": "EdmMirrorShaderNodeType",
+}
+
+
+def _io_scene_edm_addon_root() -> Optional[Path]:
+    """Directory containing ``materials/``, ``data/*.pickle``, etc."""
+    try:
+        import io_scene_edm as edm  # type: ignore
+
+        init = getattr(edm, "__file__", None)
+        if init:
+            return Path(init).resolve().parent
+    except ImportError:
+        pass
+    cand = Path(bpy.utils.user_resource("SCRIPTS", path="addons")) / "io_scene_edm"
+    return cand if cand.is_dir() else None
+
+
+def _prepare_io_scene_edm_syspath() -> Optional[str]:
+    """Return io_scene_edm add-on root as str and ensure it is on sys.path."""
+    root = _io_scene_edm_addon_root()
+    if root is None:
+        return None
+    root_s = str(root)
+    if root_s not in sys.path:
+        sys.path.insert(0, root_s)
+    return root_s
+
+
+def load_edm_material_descriptions() -> Optional[Dict[str, Any]]:
+    """MatDesc dict keyed by ``EDM_Default_Material``, … (needs add-on on sys.path)."""
+    if _prepare_io_scene_edm_syspath() is None:
+        print(
+            "ERROR: io_scene_edm add-on not found (import io_scene_edm failed and "
+            f"folder missing: {Path(bpy.utils.user_resource('SCRIPTS', path='addons')) / 'io_scene_edm'})."
+        )
+        return None
+    try:
+        from materials.materials import build_material_descriptions  # type: ignore
+
+        return build_material_descriptions()
+    except ImportError as ex:
+        print(f"ERROR: Could not import io_scene_edm material helpers: {ex}")
+        return None
+
+
+def ensure_edm_template_node_groups(cfg: dict, edm_descs: Dict[str, Any]) -> bool:
+    """
+    Legacy .blend files often have no ED node trees. ``bpy.ops.edm.import_matrials``
+    only *updates* trees that already exist, so it does nothing in that case.
+    Here we call the same ``MatDesc.create()`` path as ``node.ed_add_default``.
+    """
+    if not cfg.get("ensure_edm_node_groups", True):
+        return True
+
+    missing = [n for n in _EDM_MIGRATION_TEMPLATE_TREES if bpy.data.node_groups.get(n) is None]
+    if not missing:
+        return True
+
+    if _prepare_io_scene_edm_syspath() is None:
+        return False
+
+    ok = True
+    for name in missing:
+        mat_desc = edm_descs.get(name)
+        if mat_desc is None:
+            root = _io_scene_edm_addon_root()
+            print(
+                f'ERROR: No material description for "{name}" (missing or unreadable '
+                f"pickle under {root / 'data' if root else '?'}?)."
+            )
+            ok = False
+            continue
+        try:
+            mat_desc.create()
+            print(f'NOTE: Created missing node group "{name}" from io_scene_edm data.')
+        except Exception as ex:
+            print(f'ERROR: Failed to create node group "{name}": {ex}')
+            ok = False
+
+    still = [n for n in _EDM_MIGRATION_TEMPLATE_TREES if bpy.data.node_groups.get(n) is None]
+    if still:
+        print(f"ERROR: After template creation, still missing: {still!r}.")
+        return False
+    return ok
+
+
 def material_has_edm_group(mat: bpy.types.Material) -> bool:
+    """True if material already uses an ED *custom* shader node (export-safe)."""
     if not mat or not mat.use_nodes or not mat.node_tree:
         return False
-    names = edm_tree_names()
     for node in mat.node_tree.nodes:
-        if node.type != "GROUP":
-            continue
-        nt = getattr(node, "node_tree", None)
-        if nt and nt.name in names:
+        if getattr(node, "bl_idname", "") in _EDM_CUSTOM_SHADER_BL_IDNAMES:
             return True
     return False
 
@@ -361,17 +481,26 @@ def add_output(nt: bpy.types.NodeTree) -> bpy.types.Node:
     return nt.nodes.new(type="ShaderNodeOutputMaterial")
 
 
-def add_edm_group(nt: bpy.types.NodeTree, tree_name: str) -> bpy.types.Node:
-    grp = bpy.data.node_groups.get(tree_name)
-    if grp is None:
+def add_edm_shader_node(
+    nt: bpy.types.NodeTree, tree_name: str, edm_descs: Dict[str, Any]
+) -> bpy.types.Node:
+    """
+    Add an Eagle Dynamics custom shader node (same as ``node.ed_add_defaultnew``).
+    Plain ``ShaderNodeGroup`` + node_tree is rejected at export ("Green RW").
+    """
+    bl_id = _EDM_TREE_TO_CUSTOM_BL_ID.get(tree_name)
+    if not bl_id:
+        raise RuntimeError(f'No custom ED node type mapped for tree "{tree_name}".')
+    mat_desc = edm_descs.get(tree_name)
+    if mat_desc is None:
         raise RuntimeError(
-            f'Node group "{tree_name}" not found. Enable Eagle Dynamics io_scene_edm '
-            f"(and run Update EDM Materials once if needed)."
+            f'Material description for "{tree_name}" missing. '
+            f"Check io_scene_edm ``data/{tree_name}.pickle``."
         )
-    node = nt.nodes.new(type="ShaderNodeGroup")
-    node.node_tree = grp
+    node = nt.nodes.new(type=bl_id)
     node.name = tree_name
     node.width = 340
+    node.post_init(mat_desc)
     return node
 
 
@@ -460,7 +589,9 @@ def try_set_transparency_default(group_node: bpy.types.Node, legacy_blending: st
             pass
 
 
-def migrate_one_material(mat: bpy.types.Material, cfg: dict, roots: Sequence[Path]) -> bool:
+def migrate_one_material(
+    mat: bpy.types.Material, cfg: dict, roots: Sequence[Path], edm_descs: Dict[str, Any]
+) -> bool:
     marker = cfg["id_prop_marker"]
     if mat.get(marker):
         return False
@@ -476,9 +607,8 @@ def migrate_one_material(mat: bpy.types.Material, cfg: dict, roots: Sequence[Pat
 
     legacy_type = getattr(mat, "EDMMaterialType", LEGACY_TYPE_DEFAULT)
     tree_name = LEGACY_TO_TREE.get(str(legacy_type), "EDM_Default_Material")
-    group_nt = bpy.data.node_groups.get(tree_name)
-    if group_nt is None:
-        print(f'  SKIP "{mat.name}": tree "{tree_name}" missing.')
+    if edm_descs.get(tree_name) is None:
+        print(f'  SKIP "{mat.name}": no MatDesc for tree "{tree_name}".')
         return False
 
     exts = cfg["texture_extensions"]
@@ -489,7 +619,7 @@ def migrate_one_material(mat: bpy.types.Material, cfg: dict, roots: Sequence[Pat
 
     out = add_output(nt)
     out.location = (400, 0)
-    group_node = add_edm_group(nt, tree_name)
+    group_node = add_edm_shader_node(nt, tree_name, edm_descs)
     group_node.location = (0, 0)
     link_shader_to_output(nt, group_node, out)
 
@@ -591,6 +721,17 @@ def run_migration(cfg: Optional[dict] = None) -> Tuple[int, int]:
     if not _acquire_legacy_material_rna(cfg):
         return 0, 0
     try:
+        edm_descs = load_edm_material_descriptions()
+        if edm_descs is None:
+            return 0, 0
+
+        if not ensure_edm_template_node_groups(cfg, edm_descs):
+            print(
+                "Migration stopped: install/enable Eagle Dynamics io_scene_edm, or open "
+                "a .blend that already contains EDM_Default_Material node groups."
+            )
+            return 0, 0
+
         roots = resolve_texture_roots(cfg)
         if not roots:
             print(
@@ -610,7 +751,7 @@ def run_migration(cfg: Optional[dict] = None) -> Tuple[int, int]:
         skipped = 0
         for mat in candidates:
             try:
-                if migrate_one_material(mat, cfg, roots):
+                if migrate_one_material(mat, cfg, roots, edm_descs):
                     done += 1
                 else:
                     skipped += 1
